@@ -340,25 +340,51 @@ block; a rewrite that brings one in ranks below those that do not. On the same 1
 rewritten lines with a stock swap: v2 12 of 22, v3 7 of 20.
 
 ```bash
-python -m radio_ready.free --offset 117 --limit 100 --name free_genius118-217_free-v3
+python -m radio_ready.free --limit 100    # 100 new sections, a random sample
 ```
+
+The sections file is sorted by artist name (one section per artist), and the earlier free-v2 and
+free-v3 runs took it in file order, so they over-sample artists whose names start with symbols,
+digits or early letters. Runs now shuffle the sections with a new seed each time, from the clock (`--order random`; the seed
+is printed and saved in every output record, `--seed N` repeats it), leave out
+artist names that start with a symbol or digit (`--symbol-names` keeps them), and always skip
+sections any run of any method already covers, so every run adds new lines. The default output
+name has the date and time, so a run never overwrites another.
 
 Each run writes `outputs/generations/<name>.jsonl`; the vetting app lists all `free-v2` runs as
 one source.
 
-**Human vetting** (`annotations/vetting.csv`, every proposed line judged as written; share of
-lines per source):
+**Human vetting** (`annotations/vetting.csv`, `python -m radio_ready.pairs --stats`). A source
+is credited only with proposals that passed its filters; its fail rate is the share of the lines
+it was asked to rewrite that failed (filters, nonsense, no usable answer, or the line back
+unchanged). New words edited: of the words a rewrite changed or added against the original, the
+share the final version replaced (accepted and edited lines; a line accepted as written counts
+0). By rhyme suggestion: the share of those replaced with a word from the vetting app's rhyme
+bar (recorded in the sheet's `suggested` column since it was added; for earlier rows, inferred:
+a clean word that perfectly rhymes with the original's explicit word, under the bar's rules).
+Edits of rewrites that failed the filters are human versions, with the lines written in the
+vetting app, not a source's result.
 
-| Source | Lines | Accepted as written (like + superlike) | Edited | Disliked |
-| --- | --- | --- | --- | --- |
-| Gemini (commercial) | 70 | 73% | 14% | 13% |
-| **free v2 (local 7B)** | 113 | **66%** | 24% | **10%** |
-| free v3 (local 7B, mined stock swaps) | not vetted yet | | | |
-| Claude (commercial) | 260 | 64% | 12% | 24% |
-| free v1 (local 7B) | 65 | 61% | 26% | 12% |
-| solid (`rewrite.py`, 7B + 14B) | 261 | 53% | 26% | 21% |
-| `generate.py` v3 (7B, marked lines) | 71 | 44% | 10% | 46% |
-| noise styles | 169 | 32% | 5% | 63% |
+| Source | Failed (of lines asked) | Vetted lines | Accepted as written (like + superlike) | Edited | Disliked | New words edited | of those, by rhyme suggestion |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| free-v4 | 89% of 72 | 5 | 80% | 0% | 20% | 0% of 11 | - |
+| free-v2 | 81% of 332 | 33 | 64% | 21% | 15% | 12% of 43 | 0% of 5 |
+| Claude (commercial) | - (not filtered) | 225 | 59% | 14% | 27% | 15% of 210 | 0% of 32 |
+| free-v1 | 66% of 47 | 16 | 56% | 44% | 0% | 38% of 24 | 0% of 9 |
+| Gemini (commercial) | 1% of 252 | 151 | 54% | 19% | 27% | 20% of 137 | 7% of 27 |
+| noise | 49% of 403 | 62 | 52% | 15% | 34% | 19% of 48 | 0% of 9 |
+| solid-v1 | 69% of 1047 | 116 | 49% | 32% | 19% | 27% of 123 | 3% of 33 |
+| free-v3 | 71% of 1928 | 52 | 46% | 46% | 8% | 31% of 65 | 0% of 20 |
+| sing-v3 | 84% of 824 | 11 | 45% | 9% | 45% | 12% of 8 | 0% of 1 |
+| sing-v2 | 65% of 88 | 31 | 42% | 42% | 16% | 32% of 40 | 0% of 13 |
+| Claude windows (commercial) | - (not filtered) | 67 | 39% | 16% | 45% | 18% of 51 | 0% of 9 |
+| match / sing pilot | 4% of 24 | 13 | 38% | 54% | 8% | 27% of 22 | 0% of 6 |
+| match-v4 | 79% of 825 | 44 | 36% | 41% | 23% | 41% of 54 | 0% of 22 |
+| guided-v1 | 67% of 24 | 8 | 25% | 75% | 0% | 69% of 13 | 0% of 9 |
+| rhyme-v2 | 88% of 67 | 8 | 25% | 25% | 50% | 40% of 5 | 0% of 2 |
+| generate.py pilot runs | 5% of 370 | 259 | 19% | 9% | 71% | 18% of 119 | 0% of 21 |
+
+Human versions: 598 (402 lines written in the vetting app, 196 edits of rewrites that failed the filters). Rewrites that failed the filters count only in a source's fail rate (475 of them were judged as written).
 
 ### Other generation methods (experiments, not used for the training data)
 
@@ -447,6 +473,20 @@ the `sing-v2` list first; the `human` list then shows only lines with no accepte
 version. A section that no source pairs by itself, and whose explicit lines all have an
 accepted version somewhere (yours included), is a pair of the `human` source. First run: 101
 lines in 53 sections, 62 with a proposal (55 drafts, 7 sung rewrites) in 6 minutes.
+
+`python -m radio_ready.sing --scope all` (the default) covers every explicit line still missing
+in any generated section (no accepted version, nothing pending, including lines whose every
+candidate failed the filters: 841 lines in 441 sections) and writes two sources: `match-v4`, the
+meaning draft alone (the most surgical edit), and `sing-v3`, the best sung rewrite, so both are
+offered instead of one pick per line. Lines an earlier `sing-v2` run drafted reuse its candidates;
+a text you disliked for a line is never proposed again. Meaning: >= 0.70 to the draft and >= 0.60
+to the original line.
+
+**Noise versions for a complementary set.** `data/processed/noise_complement.jsonl`: the 238
+sections whose commercial rewrites you disliked (63) or whose accepted lines all use a stock swap
+(190), without the sections reserved for commercial evaluation (never paired) or with a noise run
+already; rewritten by Qwen3-14B with `generate.py --style noise-vowels --samples 5` (source
+`noise`).
 
 Rhyme suggestions also cover rap spellings missing from the CMU dictionary (-a, -as, -az for
 -er, -ers: playa, killa, nigga): their pronunciation comes from the -er form. Explicit words,

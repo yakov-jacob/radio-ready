@@ -33,12 +33,17 @@ verdict (it was disliked, or no model rewrote it). Write a clean version (Alt+1-
 and press Enter or Ctrl+Enter; Esc skips. Finished sections are the pairs of the human source
 (radio_ready.pairs.export_human).
 
+The "garbage" list holds the rows no source list shows: proposals that change nothing (no
+usable answer, or the original line back) and those every source marks nonsense. The sheet keeps
+each source's status on them, so they still count as that model's failures (pairs --stats).
+
 Repeated lines of a section are vetted once: a line is not asked when another occurrence of
 it already has an accepted version, or when the same rewrite of it is already asked (pairs
 use one version for every occurrence).
 
-Every verdict is saved at once. All unvetted lines come first, the most distinctive rewrites
-before generic ones ("stuff", "things"; ordered by how rare the new words are in clean lyrics).
+Every verdict is saved at once. All unvetted lines come first, the most original substitutions
+before stock ones: ordered by how rarely the proposals in the sheet add the rewrite's new words
+("girl", "stuff", "homie" come last), then by how rare they are in clean lyrics.
 Then a pause screen: close the window, or press Enter to go on to the lines already vetted
 (same order), to review or change them.
 
@@ -63,15 +68,17 @@ from tkinter import font as tkfont
 from radio_ready import paths
 from radio_ready.explicit import ExplicitDetector
 from radio_ready.pairs import (
-    APPROVE, HUMAN, HUMAN_REQUEST, SECTION_FILES, YOURS, add_your_version, line_key, load_sheet, only_nonsense,
-    source_names,
-    sources, update, write_sheet,
+    APPROVE, HUMAN, HUMAN_REQUEST, SECTION_FILES, YOURS, add_your_version, garbage, line_key,
+    load_sheet, only_nonsense, source_names, sources, update, write_sheet,
 )
 from radio_ready.text import syllables
 
 WORD = re.compile(r"[a-z']+")
 CORPUS_FILES = ["corpus_200k.jsonl", "corpus.jsonl"]
 ALL = "All sources"
+WATCH_MS = 30_000  # how often the start window looks for new generation runs
+GARBAGE = "garbage"  # one list for rows no source list shows: no change, or nonsense
+
 
 
 def word_rarity() -> tuple[Counter, int]:
@@ -88,12 +95,30 @@ def word_rarity() -> tuple[Counter, int]:
     return Counter(), 1
 
 
+def added_words(original: str, rewrite: str) -> list[str]:
+    old = set(WORD.findall(original.lower()))
+    return [w for w in WORD.findall(rewrite.lower()) if w not in old]
+
+
 def uniqueness(original: str, rewrite: str, counts: Counter, total: int) -> float:
     """Mean surprisal of the words the rewrite adds (rare words score high, "stuff" low)."""
-    new = [w for w in WORD.findall(rewrite.lower()) if w not in set(WORD.findall(original.lower()))]
+    new = added_words(original, rewrite)
     if not new:
         return 0.0
     return sum(-math.log((counts[w] + 1) / total) for w in new) / len(new)
+
+
+def substitution_counts(rows: list[dict]) -> tuple[Counter, int]:
+    """How often each word is added by the proposals in the sheet (each distinct rewrite of a
+    line once): the stock swaps every model reaches for ("stuff", "chick") count high."""
+    counts, seen = Counter(), set()
+    for r in rows:
+        text = r.get("rewrite", "")
+        key = (r["id"], r["line"], text)
+        if text and key not in seen:
+            seen.add(key)
+            counts.update(set(added_words(r.get("original", ""), text)))
+    return counts, max(1, len(seen))
 
 
 def load_sections(ids: set[str] | None = None) -> dict[str, tuple[str, dict]]:
@@ -149,6 +174,7 @@ class App:
         self.sections, self.detector, self.source = sections, detector, title
         self.pos, self.history, self.context = 0, [], False
         self.drafts: dict[int, str] = {}  # row index -> text typed but not voted on
+        self.inserted: dict[int, set[str]] = {}  # row index -> suggestion words put in
         self.suggestions, self.results, self.pending, self.slots = [], queue.Queue(), None, []
         base = tkfont.nametofont("TkDefaultFont").actual()["family"]
         big = (base, 15)
@@ -215,7 +241,7 @@ class App:
 
     def yours(self, row: dict) -> str:
         """Your latest saved version of this line for this list ("" if none)."""
-        names = source_names(row) if self.source == ALL else {self.source}
+        names = source_names(row) if self.source in (ALL, GARBAGE) else {self.source}
         found = [r for r in self.rows if r is not row and r["id"] == row["id"]
                  and r["line"] == row["line"] and r.get("rewrite")
                  and any(f"{n}: {YOURS}" in r.get("sources", "") for n in names)]
@@ -328,12 +354,19 @@ class App:
                 return
         if verdict != "dislike" and text and text != self.proposed(r):
             # your own version: a row of its own for this list; the proposal keeps its verdict
-            names = source_names(r) if self.source == ALL else {self.source}
-            if add_your_version(self.rows, r, text, verdict, names) is None:
+            names = source_names(r) if self.source in (ALL, GARBAGE) else {self.source}
+            words = set(re.findall(r"[\w']+", text.lower()))
+            used = " ".join(sorted(w for w in self.inserted.get(self.order[self.pos], ())
+                                   if w.lower() in words))
+            mine = add_your_version(self.rows, r, text, verdict, names)
+            if mine is None:
                 # the same line has another verdict in another list: keep it on this row
                 r["edit"], r["verdict"] = text, verdict
+                mine = r
             else:
                 r["verdict"] = r.get("verdict") or "edited"
+            if used:
+                mine["suggested"] = used
             saved = f"your version of line {r['line']} ({verdict}, a pair of its own)"
         else:
             r["verdict"] = verdict
@@ -344,6 +377,7 @@ class App:
         except PermissionError:
             self.status.config(text="could not save: close the sheet in Excel (kept in memory)")
         self.drafts.pop(self.order[self.pos], None)
+        self.inserted.pop(self.order[self.pos], None)
         self.history.append(self.pos)
         self.pos += 1
         self.show()
@@ -444,48 +478,63 @@ class App:
         tokens = self.edit.get("1.0", "end").strip().split(" ")
         slot = s["slot"]
         tokens[slot["start"]:slot["end"]] = [s["word"] + slot["punct"]]
+        self.inserted.setdefault(self.order[self.pos], set()).add(s["word"])
         self.edit.delete("1.0", "end")
         self.edit.insert("1.0", " ".join(tokens))
         self.update_info()
         self.load_suggestions()  # the slots moved: recompute for the new text
 
 
-def open_source(window, name: str, rows, sections) -> bool:
-    """A vetting window over the rows of one source (or all): every unvetted line first, then,
-    after a pause screen, the lines already vetted."""
-    mine = [k for k, r in enumerate(rows) if name == ALL or name in source_names(r)]
-    unvetted = [k for k in mine if not rows[k].get("verdict") and not only_nonsense(rows[k])]
-    if name == HUMAN:  # lines to write: asked until any source has an accepted version of
-        # them, and not while a proposal of them (e.g. sing-v2) waits for your verdict
+def vetting_queue(rows: list[dict], name: str) -> tuple[list[int], list[int]]:
+    """(unvetted, vetted) row indexes a list shows. Every version of a line is an option of its
+    own; repeated lines of a section share their versions (radio_ready.pairs.share_repeats),
+    so a rewrite is asked once for all occurrences of a line, and not again when the same text
+    already has a verdict on any of them. The human list asks a line until any source has an
+    accepted version of it, and not while a proposal of it waits for a verdict."""
+    if name == GARBAGE:
+        mine = [k for k, r in enumerate(rows) if garbage(r)]
+    else:
+        mine = [k for k, r in enumerate(rows) if (name == ALL or name in source_names(r))
+                and not garbage(r)]
+    unvetted = [k for k in mine if not rows[k].get("verdict")]
+    group = lambda r: (r["id"], line_key(r.get("original", "")))  # noqa: E731
+    text = lambda r: (r.get("edit") or "").strip() or r.get("rewrite", "")  # noqa: E731
+    if name == HUMAN:
         settled = {(r["id"], r["line"]) for r in rows
                    if r.get("verdict", "").strip().lower() in APPROVE
                    or (r.get("rewrite") and not r.get("verdict", "").strip())}
+        accepted = {group(r) for r in rows if r.get("verdict", "").strip().lower() in APPROVE}
         unvetted = [k for k in mine if f"{HUMAN}: {HUMAN_REQUEST}" in rows[k].get("sources", "")
-                    and (rows[k]["id"], rows[k]["line"]) not in settled]
-    # Repeated lines of a section share their versions (radio_ready.pairs.share_repeats): skip
-    # a line when another occurrence of it already has an accepted version, or when the same
-    # rewrite of it is already in the queue.
-    accepted = {(r["id"], line_key(r.get("original", ""))) for r in rows
-                if r.get("verdict", "").strip().lower() in APPROVE}
+                    and (rows[k]["id"], rows[k]["line"]) not in settled
+                    and group(rows[k]) not in accepted]
+    judged = {(group(r), text(r)) for r in rows if r.get("verdict")}
     queued, kept = set(), []
     for k in sorted(unvetted, key=lambda k: (rows[k]["id"], int(rows[k]["line"]))):
-        r = rows[k]
-        group = (r["id"], line_key(r.get("original", "")))
-        text = (r.get("edit") or "").strip() or r.get("rewrite", "")
-        if group in accepted or (group, text) in queued:
+        key = (group(rows[k]), text(rows[k]))
+        if key in judged or key in queued:
             continue
-        queued.add((group, text))
+        queued.add(key)
         kept.append(k)
-    unvetted = kept
-    vetted = [k for k in mine if rows[k].get("verdict")]
+    return kept, [k for k in mine if rows[k].get("verdict")]
+
+
+def open_source(window, name: str, rows, sections) -> bool:
+    """A vetting window over the rows of one source (or all): every unvetted line first, then,
+    after a pause screen, the lines already vetted."""
+    unvetted, vetted = vetting_queue(rows, name)
     if not unvetted and not vetted:
         return False
     counts, total = word_rarity()
+    swaps, n_swaps = substitution_counts(rows)
 
     def ranked(ks):
-        return [k for _, k in sorted(((uniqueness(rows[k]["original"], rows[k].get("edit") or
-                                                  rows[k].get("rewrite", ""), counts, total), k)
-                                      for k in ks), reverse=True)]
+        """Most original substitutions first: words the proposals rarely add, then words rare
+        in clean lyrics."""
+        def score(k):
+            text = rows[k].get("edit") or rows[k].get("rewrite", "")
+            return (round(uniqueness(rows[k]["original"], text, swaps, n_swaps), 1),
+                    uniqueness(rows[k]["original"], text, counts, total))
+        return sorted(ks, key=score, reverse=True)
 
     App(window, rows, ranked(unvetted) + ranked(vetted), sections, ExplicitDetector(), name,
         boundary=len(unvetted))
@@ -501,7 +550,7 @@ class Launcher:
         root.geometry("760x440")
         base = tkfont.nametofont("TkDefaultFont").actual()["family"]
         tk.Label(root, text="Double-click or Enter to vet. New runs and all pairs update by "
-                            "themselves when this window opens and after each vetting window.",
+                            "themselves (new runs within 30 s while no vetting window is open).",
                  anchor="w", fg="#555").pack(fill="x", padx=12, pady=(10, 4))
         self.list = tk.Listbox(root, font=(base, 12), activestyle="dotbox")
         self.list.pack(fill="both", expand=True, padx=12)
@@ -515,7 +564,9 @@ class Launcher:
         self.busy, self.again, self.waiting, self.windows = False, False, None, 0
         self.done: queue.Queue = queue.Queue()
         self.reload()
+        self.runs = self.run_files()
         self.start_update()
+        self.root.after(WATCH_MS, self.watch)
 
     def reload(self) -> None:
         self.sections = load_sections()
@@ -526,6 +577,8 @@ class Launcher:
         keep = self.selected()
         self.items = [(ALL, f"{ALL}    {self.count(ALL)}")]
         self.items.append((HUMAN, f"{HUMAN} (finish sections yourself)    {self.count(HUMAN)}"))
+        self.items.append((GARBAGE, f"{GARBAGE} (no change or nonsense, all sources)    "
+                                    f"{self.count(GARBAGE)}"))
         # sources with runs on this machine, then those known only from the shared sheet
         # (outputs/ is not shared: a teammate vets every proposal through the sheet)
         names = list(sources())
@@ -548,17 +601,31 @@ class Launcher:
             done = {(r["id"], r["line"]) for r in self.rows
                     if r.get("verdict", "").strip().lower() in APPROVE} & asked
             return f"{len(done)}/{len(asked)} lines finished" if asked else "nothing to finish"
-        rows = [r for r in self.rows if (name == ALL or name in source_names(r))
-                and not only_nonsense(r)]
-        if not rows:
+        unvetted, vetted = vetting_queue(self.rows, name)
+        if not unvetted and not vetted:
             return "new: its lines appear after the update" if self.busy else "nothing to vet"
-        return f"{sum(bool(r.get('verdict')) for r in rows)}/{len(rows)} lines vetted"
+        return f"{len(vetted)}/{len(vetted) + len(unvetted)} lines vetted"
 
     def selected(self) -> str | None:
         sel = self.list.curselection() if hasattr(self, "items") else ()
         return self.items[sel[0]][0] if sel else None
 
     # --- background update --------------------------------------------------------------------
+
+    @staticmethod
+    def run_files() -> dict[str, float]:
+        """Generation runs on this machine, with their modification times."""
+        return {f.name: f.stat().st_mtime for f in paths.GENERATIONS_DIR.glob("*.jsonl")}
+
+    def watch(self) -> None:
+        """New or changed runs are picked up by themselves: an update runs as soon as no
+        vetting window is open (a window holds its own copy of the sheet)."""
+        runs = self.run_files()
+        if runs != self.runs and not self.windows:
+            self.runs = runs
+            self.status.config(text="New runs found ...")
+            self.start_update()
+        self.root.after(WATCH_MS, self.watch)
 
     def start_update(self) -> None:
         if self.busy:

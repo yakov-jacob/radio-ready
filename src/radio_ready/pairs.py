@@ -78,6 +78,7 @@ Run:  python -m radio_ready.pairs --update                 # everything (what th
 import argparse
 import csv
 import json
+import difflib
 import re
 from collections import Counter
 from pathlib import Path
@@ -87,6 +88,7 @@ from radio_ready.commercial import reserved_ids
 from radio_ready.explicit import ExplicitDetector
 from radio_ready.labels import artist_split
 from radio_ready.linediff import apply, diff
+from radio_ready.text import restore_quotes
 
 PAIRS_DIR = paths.ROOT / "pairs"
 SECTION_FILES = {"genius": paths.GENIUS_SECTIONS_JSONL,
@@ -95,7 +97,9 @@ SHEET = paths.ANNOTATIONS / "vetting.csv"
 OLD_SHEETS = [paths.ANNOTATIONS / "pair_edits.csv", *sorted((paths.ANNOTATIONS / "edits")
                                                              .glob("*.csv"))]
 SHEET_COLUMNS = ["id", "line", "artist", "title", "rewrite_diff", "edit_diff", "verdict",
-                 "note", "sources"]
+                 "note", "sources", "suggested"]
+# suggested: clean rhyme words put in from the vetting app's suggestion bar (Alt/Cmd+1-9) that
+# are still in the saved version, space-separated (empty for rows vetted before it was recorded)
 APPROVE = {"like", "superlike"}
 REMOVED_SOURCES: set[str] = set()  # sources whose rows are dropped from the sheet on export
 NOISE = "noise"
@@ -112,6 +116,19 @@ def only_nonsense(row: dict) -> bool:
     """Every source that proposed this row marks it nonsense (vet skips these rows)."""
     parts = [s for s in row.get("sources", "").split("; ") if s]
     return bool(parts) and all(s.split(": ", 1)[-1] == NONSENSE for s in parts)
+
+
+def garbage(row: dict) -> bool:
+    """A proposal that changes nothing (no usable answer, or the original line back) or that
+    every source marks nonsense. Kept out of the source lists; the garbage list shows them.
+    Requests of the human list and your own versions are never garbage."""
+    statuses = {s.split(": ", 1)[-1] for s in row.get("sources", "").split("; ") if s}
+    if statuses & {HUMAN_REQUEST, YOURS}:
+        return False
+    rewrite = row.get("rewrite", "")
+    return only_nonsense(row) or not rewrite or rewrite == row.get("original")
+
+
 FINAL = "final"
 LINES = "lines"
 
@@ -136,7 +153,7 @@ def generation_path(name: str) -> Path:
     return paths.GENERATIONS_DIR / f"{name}.jsonl"  # names contain dots ("qwen2.5-...")
 
 
-METHOD = re.compile(r"(?:solid|free|guided|rhyme|sing)_.+_((?:solid|free|guided|rhyme|sing)-v\d+)")
+METHOD = re.compile(r"(?:solid|free|guided|rhyme|sing|match)_.+_((?:solid|free|guided|rhyme|sing|match)-v\d+)")
 
 
 def method(stem: str) -> str:
@@ -555,6 +572,8 @@ def export_source(name: str, spec: dict, sections, rows: list[dict], detector) -
     yours = your_versions(rows)
     reserved = set() if spec["include_reserved"] else reserved_ids()
     pairs, dropped, seen, new = [], Counter(), set(), 0
+    tagged = {id(r) for r in rows if name in source_names(r)}  # rows this source proposed before
+    touched: set[int] = set()
     for path in spec["files"]:
         for line in open(path, encoding="utf-8"):
             gen = json.loads(line)
@@ -564,6 +583,16 @@ def export_source(name: str, spec: dict, sections, rows: list[dict], detector) -
             source, rec = sections[gen["id"]]
             lines = list(gen["lines"]) if gen.get("valid") and gen.get("lines") \
                 else list(rec["lines"])
+            for i, (a, b) in enumerate(zip(rec["lines"], lines)):
+                fixed = restore_quotes(a, b)  # quote marks the model dropped
+                if fixed != b:
+                    lines[i] = fixed
+                    old = by_key.get((gen["id"], i + 1, diff_cell(a, b)))
+                    key = (gen["id"], i + 1, diff_cell(a, fixed))
+                    if old is not None and key not in by_key:  # its verdict carries over
+                        del by_key[row_key(old)]
+                        old["rewrite_diff"], old["rewrite"] = key[2], fixed
+                        by_key[key] = old
             reason = (None if gen.get("valid") and gen.get("passed") is not False
                       else "no usable answer" if not gen.get("valid") else "failed filters")
             if reason is None and spec["require_approval"]:
@@ -584,6 +613,7 @@ def export_source(name: str, spec: dict, sections, rows: list[dict], detector) -
                     row = by_key.get((gen["id"], i + 1, diff_cell(a, b))) if a != b else None
                     if row is not None:  # already in the sheet: mark it, so vet skips it
                         add_source(row, name, NONSENSE)
+                        touched.add(id(row))
                 continue
             todo = sorted({i for i, (a, b) in enumerate(zip(rec["lines"], lines)) if a != b}
                           | set(gen.get("targets", [])))
@@ -602,6 +632,7 @@ def export_source(name: str, spec: dict, sections, rows: list[dict], detector) -
                     rows.append(row)
                     new += 1
                 add_source(row, name, status)
+                touched.add(id(row))
                 verdict = row.get("verdict", "").strip().lower()
                 if verdict:
                     verdicts[str(i)] = verdict
@@ -629,6 +660,15 @@ def export_source(name: str, spec: dict, sections, rows: list[dict], detector) -
                     pair["human_edited"], pair["human_verdicts"] = edited, used
                     pair["from"], pair["edited"] = [name], bool(edited)
                     pairs.append(pair)
+    # a rerun no longer proposes these rows: unvetted ones lose this source (rows only it
+    # proposed leave the sheet); vetted ones keep it, so the verdict still counts for it
+    for r in rows:
+        if id(r) in tagged and id(r) not in touched and not r.get("verdict"):
+            status = next((x.split(": ", 1)[-1] for x in r.get("sources", "").split("; ")
+                           if x.split(":", 1)[0] == name), "")
+            if status != YOURS:
+                r["sources"] = "; ".join(x for x in r.get("sources", "").split("; ")
+                                         if x and x.split(":", 1)[0] != name)
     write_pairs(name, pairs)
     return (f"{name}: {len(pairs)} pairs {dict(Counter(p['split'] for p in pairs))}, "
             f"{sum(bool(p['human_edited']) for p in pairs)} with your edits; {new} new lines "
@@ -910,6 +950,149 @@ def update() -> str:
                      + [combine()])
 
 
+PASSED = {"kept", "needs approval"}  # statuses of a proposal that passed the source's filters
+STAT_GROUPS = [  # (label, pattern on the source name), first match wins
+    ("Gemini (commercial)", r"commercial-gemini"),
+    ("Claude (commercial)", r"commercial-claude"),
+    ("Claude windows (commercial)", r"commercial-windows-claude"),
+    ("match / sing pilot", r"(match|sing)-qwen.*"),
+    ("generate.py pilot runs", r"qwen.*"),
+]
+
+
+def stat_label(name: str) -> str:
+    for label, pattern in STAT_GROUPS:
+        if re.fullmatch(pattern, name):
+            return label
+    return name
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[\w']+", text.lower())
+
+
+def new_words(original: str, rewrite: str, final: str,
+              rhyme=lambda w: False) -> tuple[int, int, int]:
+    """(words the rewrite changed or added against the original, how many of those the final
+    version no longer has, how many of those it replaced with a word `rhyme` accepts), aligned
+    word by word."""
+    o, r, f = _words(original), _words(rewrite), _words(final)
+    new = set(range(len(r)))
+    for a, _, n in difflib.SequenceMatcher(None, r, o, autojunk=False).get_matching_blocks():
+        new -= set(range(a, a + n))
+    changed = rhymed = 0
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, r, f, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        n = len(new & set(range(i1, i2)))
+        changed += n
+        if n and any(rhyme(w) for w in f[j1:j2]):
+            rhymed += n
+    return len(new), changed, rhymed
+
+
+def rhyme_check(original: str, suggested: str, detector):
+    """Whether a word of the final version is a rhyme suggestion: one recorded by the vetting
+    app (column suggested) or, for rows vetted before it was recorded, a clean word that
+    perfectly rhymes with an explicit word of the original (inferred)."""
+    if suggested.strip():
+        recorded = set(_words(suggested))
+        return lambda w: w in recorded
+    from radio_ready.rhymes import common_words, keys, never_suggest, part_alike, sounds_like
+    explicit = {w.lower() for w in detector.find(original)}
+    targets = {keys(w)[0]: w for w in explicit if keys(w)[0]}
+    skip = set(_words(original)) | explicit | never_suggest() | common_words()
+
+    def rhyme(w: str) -> bool:  # the suggestion bar's rules: no common or sound-alike words
+        e = targets.get(keys(w)[0]) if w not in skip else None
+        return (e is not None and not detector.find(w) and not sounds_like(w, e)
+                and not part_alike(w, e))
+    return rhyme
+
+
+def stats(rows: list[dict] | None = None) -> str:
+    """Vetting results per source, as a markdown table. A source is credited only with the
+    proposals that passed its filters; its fail rate is the share of the lines it was asked to
+    rewrite that failed (filters, nonsense, no usable answer, or no change). Edits of rewrites that failed the filters are human versions (with the
+    lines written in the vetting app), not a source's result. New words edited: of the words a
+    rewrite changed or added against the original, the share the final version replaced (lines
+    accepted as written count 0, disliked lines are left out); by rhyme suggestion: the share
+    replaced with a suggested rhyme (rhyme_check)."""
+    from radio_ready.explicit import ExplicitDetector
+
+    rows = load_sheet(load_sections()) if rows is None else rows
+    yours = your_versions(rows)
+    detector = ExplicitDetector()
+    counts: dict[str, Counter] = {}
+    written = edited_failed = judged_failed = 0
+    proposed: dict[str, Counter] = {}  # every proposal in the sheet, vetted or not
+    for r in rows:
+        # a line a model was asked to rewrite: passed, or failed (filters, nonsense, no usable
+        # answer, or the line back unchanged)
+        unchanged = not r.get("rewrite") or r["rewrite"] == r.get("original")
+        for part in filter(None, r.get("sources", "").split("; ")):
+            name, _, status = part.partition(": ")
+            if status in PASSED or status.startswith("dropped: ") or status == NONSENSE:
+                ok = status in PASSED and not unchanged
+                proposed.setdefault(stat_label(name), Counter())[ok] += 1
+        verdict = r.get("verdict", "").strip().lower()
+        if not verdict:
+            continue
+        edited = bool((r.get("edit") or "").strip()) or verdict == "edited"
+        bucket = "edited" if edited else "accepted" if verdict in APPROVE else "disliked"
+        passed, statuses = set(), set()
+        for part in filter(None, r.get("sources", "").split("; ")):
+            name, _, status = part.partition(": ")
+            statuses.add(status)
+            if status in PASSED:
+                passed.add(stat_label(name))
+        if passed:
+            final, suggested = None, r.get("suggested") or ""
+            if bucket == "accepted":
+                final = r["rewrite"]
+            elif bucket == "edited":
+                final = (r.get("edit") or "").strip() or None
+                if final is None and yours.get((r["id"], int(r["line"]))):
+                    mine = max(yours[(r["id"], int(r["line"]))], key=lambda y: difflib.
+                               SequenceMatcher(None, y["rewrite"], r["rewrite"]).ratio())
+                    final, suggested = mine["rewrite"], mine.get("suggested") or ""
+            if final is not None:
+                n_new, n_changed, n_rhymed = new_words(
+                    r["original"], r["rewrite"], final,
+                    rhyme_check(r["original"], suggested, detector))
+            for label in passed:
+                counts.setdefault(label, Counter())[bucket] += 1
+                if final is not None:
+                    counts[label]["new"] += n_new
+                    counts[label]["changed"] += n_changed
+                    counts[label]["rhymed"] += n_rhymed
+        elif YOURS in statuses:
+            written += verdict in APPROVE
+        elif edited:
+            edited_failed += 1
+        else:
+            judged_failed += 1
+    out = ["| Source | Failed (of lines asked) | Vetted lines | Accepted as written "
+           "(like + superlike) | Edited | Disliked | New words edited | of those, by rhyme suggestion |",
+           "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    verdicts = ("accepted", "edited", "disliked")
+    for label, c in sorted(counts.items(), key=lambda kv: -kv[1]["accepted"] / sum(
+            kv[1][v] for v in verdicts)):
+        n = sum(c[v] for v in verdicts)
+        changed = f"{c['changed'] / c['new']:.0%} of {c['new']}" if c["new"] else "-"
+        rhymed = f"{c['rhymed'] / c['changed']:.0%} of {c['changed']}" if c["changed"] else "-"
+        p = proposed.get(label, Counter())
+        failed = (f"{p[False] / sum(p.values()):.0%} of {sum(p.values())}" if p[False]
+                  else "- (not filtered)")
+        out.append(f"| {label} | {failed} | {n} | {c['accepted'] / n:.0%} | "
+                   f"{c['edited'] / n:.0%} | {c['disliked'] / n:.0%} | {changed} | {rhymed} |")
+    out += ["", f"Human versions: {written + edited_failed} ({written} lines written in the vetting app, "
+                f"{edited_failed} edits of rewrites that failed the filters). Rewrites that "
+                f"failed the filters count only in a source's fail rate ({judged_failed} of them "
+                f"were judged as written)."]
+    return "\n".join(out)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export, combine or rebuild synthetic pairs.")
     parser.add_argument("sources", nargs="*", help="source names (see the module docstring)")
@@ -919,7 +1102,12 @@ def main() -> None:
     parser.add_argument("--combine", action="store_true", help="write pairs/final.*")
     parser.add_argument("--rebuild", action="store_true",
                         help="full pairs from pairs/*.patch.jsonl and the section records")
+    parser.add_argument("--stats", action="store_true",
+                        help="vetting results per source (proposals that passed its filters)")
     args = parser.parse_args()
+    if args.stats:
+        print(stats())
+        return
     if args.update:
         print(update())
         return
@@ -930,7 +1118,7 @@ def main() -> None:
     if args.combine:
         print(combine())
     if not (args.rebuild or args.sources or args.all or args.combine):
-        parser.error("give sources, --all, --combine or --rebuild")
+        parser.error("give sources, --all, --combine, --rebuild or --stats")
 
 
 if __name__ == "__main__":

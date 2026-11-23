@@ -40,9 +40,11 @@ Run:  python -m radio_ready.free [--input FILE] [--offset 0] [--limit 10] [--ver
 import argparse
 import difflib
 import json
-from collections import Counter
+import math
+import random
 import re
 import time
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 
@@ -55,6 +57,7 @@ from radio_ready.scoring import TOXICITY_THRESHOLD, Fluency, Similarity, Toxicit
 from radio_ready.text import end_rhyme_kept, syllables
 
 VERSIONS = {1: "free-v1", 2: "free-v2", 3: "free-v3"}
+# free-v4 (one free rewrite of each line) was dropped as a method; its runs stay as data
 MODEL = "Qwen/Qwen2.5-7B-Instruct"
 N_EXAMPLES = 6
 
@@ -232,6 +235,88 @@ CREATIVE_V3 = """Do not just swap a censored word for a stock substitute: those 
 """
 
 
+def added(new: str, original: str) -> set[str]:
+    """Content words a rewrite brings in that its original line does not have."""
+    have = {w.lower() for w in WORD.findall(original)}
+    return {w.lower() for w in WORD.findall(new)} - have - STOP
+
+
+def changed_share(new: str, original: str) -> float:
+    """Share of the original line's words the rewrite changes (word alignment)."""
+    o, n = [w.lower() for w in WORD.findall(original)], [w.lower() for w in WORD.findall(new)]
+    if not o:
+        return 0.0
+    kept = sum(b.size for b in difflib.SequenceMatcher(None, o, n, autojunk=False)
+               .get_matching_blocks())
+    return round(1 - kept / len(o), 3)
+
+
+ANSWER_PREFIX = re.compile(r"^\s*(?:>>>\s*)?(?:\d+[.):]\s*)?")
+# standard spellings that replace an artist's spelling (gon -> gonna, wit -> with, fuckin' ->
+# messing): counted on every candidate, a soft tie-break in rank (it never fails a line)
+STANDARD = {"gon": {"gonna", "going"}, "wit": {"with"}, "dat": {"that"}, "dem": {"them"},
+            "'em": {"them"}, "em": {"them"}, "ya": {"you", "your"}, "tryna": {"trying"},
+            "finna": {"fixing"}, "ain't": {"isn't", "aren't", "am"}, "y'all": {"you"},
+            "lil": {"little"}, "cuz": {"because"}, "'cause": {"because"}, "da": {"the"}}
+
+
+def answer_line(text: str) -> str | None:
+    """The first line of an answer; quotes are removed only when they wrap the whole line."""
+    text = text.replace("�", "'").replace("’", "'").replace("‘", "'")
+    text = text.replace("“", '"').replace("”", '"')  # curly or broken quotes
+    for row in text.strip().splitlines():
+        row = clean_response_line(ANSWER_PREFIX.sub("", row.strip().strip("`")))
+        if len(row) > 1 and row[0] == row[-1] and row[0] in "\"'":
+            row = row[1:-1].strip()
+        if row:
+            return row
+    return None
+
+
+def spelling_lost(new: str, original: str) -> list[str]:
+    """Standard spellings the rewrite uses where the original has the artist's own."""
+    o = [w.lower() for w in re.findall(r"[A-Za-z']+", original)]
+    n = {w.lower() for w in re.findall(r"[A-Za-z']+", new)}
+    lost = {s for w in o for s in STANDARD.get(w, ())} & n
+    if any(w.endswith("in'") for w in o):  # dropped g: -ing words the original did not have
+        lost |= {w for w in n if w.endswith("ing") and len(w) > 4} - set(o)
+    return sorted(lost)
+
+
+@lru_cache(maxsize=1)
+def substitution_sections() -> tuple[dict[str, set[str]], int]:
+    """{word: ids of the sections whose proposals in the vetting sheet add it}, number of
+    sections: stock swaps are added in many sections, by many artists."""
+    found: dict[str, set[str]] = {}
+    ids = set()
+    for r in sheet_rows():
+        if r.get("rewrite"):
+            ids.add(r["id"])
+            for w in added(r["rewrite"], r.get("original", "")):
+                found.setdefault(w, set()).add(r["id"])
+    return found, max(1, len(ids))
+
+
+def originality(new: str, original: str, sid: str) -> float:
+    """Mean surprisal of the words the rewrite adds, under how many other sections' rewrites
+    (other songs and artists) add them; the section's own rewrites do not count."""
+    words = added(new, original)
+    if not words:
+        return 0.0
+    found, total = substitution_sections()
+    return round(sum(-math.log((len(found.get(w, set()) - {sid}) + 1) / total) for w in words)
+                 / len(words), 3)
+
+
+def vocabulary(new: str, original: str) -> float:
+    """Share of the added words that are lyric vocabulary (seen in clean lyrics)."""
+    words = added(new, original)
+    if not words:
+        return 1.0
+    known = lyric_words()
+    return round(sum(w in known for w in words) / len(words), 3)
+
+
 def creative_v3(censored: list[str]) -> str:
     stock, _ = stock_table()
     parts = []
@@ -381,12 +466,11 @@ def ask(tok, model, scorer, record, lines, start, todo, shot_text, samples, atte
     detector = scorer.detector
     targets = {i: sorted(set(detector.find(record["lines"][i]))) for i in todo}
     shown, notes = block_text(lines, start, targets, record, detector)
+    creative = (creative_v3([w for i in todo for w in targets[i]]) if version >= 3
+                else CREATIVE.format(generic=", ".join(f'"{w}"' for w in generic_words()[:12]))
+                if version >= 2 else "")
     user = PROMPT.format(title=record["title"], artist=record["artist"], block=shown,
-                         flagged=notes, examples=shot_text,
-                         creative=(creative_v3([w for i in todo for w in targets[i]])
-                                   if version >= 3 else CREATIVE.format(generic=", ".join(
-                                       f'"{w}"' for w in generic_words()[:12]))
-                                   if version >= 2 else ""))
+                         flagged=notes, examples=shot_text, creative=creative)
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
     raws = complete(tok, model, msgs, 1, 256, 0.0, 1.0, False)
     if samples:
@@ -404,46 +488,170 @@ def ask(tok, model, scorer, record, lines, start, todo, shot_text, samples, atte
     return found, raws
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Freer 7B radio edits of flagged lines.")
+DENSE_WORDS = 3  # a line saturated with profanity: this many explicit words, or
+DENSE_SHARE = 0.25  # at least 2 that make up this share of its words 
+
+
+def dense(line: str, detector) -> bool:
+    n, words = len(detector.find(line)), len(WORD.findall(line))
+    return n >= DENSE_WORDS or (n >= 2 and words > 0 and n / words >= DENSE_SHARE)
+
+
+def open_lines(detector, include_pending: bool = False
+               ) -> tuple[dict[str, dict], dict[str, list[int]]]:
+    """Sections of the vetting sheet and, per section, its explicit lines still open: no
+    accepted version in any source, and no proposal waiting for a verdict other than garbage
+    (no change or nonsense). That is every line whose proposals were all rejected, garbage, or
+    asked in the human list. One line per group of repeated lines."""
+    from radio_ready.pairs import (accepted_texts, garbage, load_sections, load_sheet,
+                                   repeat_groups)
+
+    sections = load_sections()
+    rows = load_sheet(sections)
+    accepted = accepted_texts(rows)
+    pending = set() if include_pending else {
+        (r["id"], int(r["line"])) for r in rows
+        if r.get("rewrite") and not r.get("verdict", "").strip() and not garbage(r)}
+    records, found = {}, {}
+    for sid in sorted({r["id"] for r in rows}):
+        if sid not in sections:
+            continue
+        lines = sections[sid][1]["lines"]
+        explicit = [i for i, l in enumerate(lines) if detector.find(l)]
+        todo = [g[0] for g in repeat_groups(lines, explicit)
+                if not any(accepted.get((sid, i + 1)) or (sid, i + 1) in pending for i in g)]
+        if todo:  # shown with the accepted versions of its other lines (prompt context only)
+            shown = [accepted[(sid, i + 1)][0][0] if accepted.get((sid, i + 1)) else l
+                     for i, l in enumerate(lines)]
+            records[sid], found[sid] = {**sections[sid][1], "shown": shown}, todo
+    return records, found
+
+
+def generated_ids() -> set[str]:
+    """Ids of every section any generation run (any method, any model) already covers."""
+    done = set()
+    for f in paths.GENERATIONS_DIR.glob("*.jsonl"):
+        for line in open(f, encoding="utf-8"):
+            m = re.search(r'"id": "([0-9a-f]+)"', line[:80])
+            if m:
+                done.add(m.group(1))
+    return done
+
+
+def main(method: dict | None = None) -> None:
+    """Free runs, or with `method` a one-line-at-a-time method that shares the section
+    selection, scoring and output: {prefix, version, description, ask, rank}."""
+    parser = argparse.ArgumentParser(description=method["description"] if method
+                                     else "Freer 7B radio edits of flagged lines.")
     parser.add_argument("--input", default=str(paths.GENIUS_SECTIONS_JSONL))
     parser.add_argument("--offset", type=int, default=0, help="skip the first N sections")
-    parser.add_argument("--limit", type=int, default=10)
-    parser.add_argument("--version", type=int, choices=sorted(VERSIONS), default=3)
+    parser.add_argument("--order", choices=["random", "file"], default="random",
+                        help="random: a seeded shuffle of the sections (the file is sorted by "
+                             "artist name, so taking it in order over-samples artists whose "
+                             "names start with symbols or digits); file: the file's order")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="shuffle seed (default: the current time, a new one per run; printed and saved "
+                             "in every output record, so the run can be reproduced)")
+    parser.add_argument("--symbol-names", action="store_true",
+                        help="also sample artists whose names start with a symbol or digit "
+                             "($lim, 03osc): 2.4%% of the sections but 63%% of the Genius "
+                             "sections generated in file order, so left out by default")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="sections (default 10; all with --missing)")
+    if method is None:
+        parser.add_argument("--version", type=int, choices=sorted(VERSIONS), default=3)
     parser.add_argument("--name", default=None)
     parser.add_argument("--model", default=MODEL)
-    parser.add_argument("--samples", type=int, default=4)
+    parser.add_argument("--samples", type=int, default=None,
+                        help="sampled rewrites per call (default 4)")
+    parser.add_argument("--missing", action="store_true",
+                        help="the open lines of the vetting sheet (rejected, garbage, human list) "
+                             "instead of --input; --offset/--limit apply to their sections")
+    parser.add_argument("--dense", action="store_true",
+                        help="only lines saturated with profanity (>= 3 explicit words, or >= 2 "
+                             "that are >= 25%% of the line)")
+    parser.add_argument("--include-pending", action="store_true",
+                        help="with --missing: also lines whose proposals still wait for a verdict")
     parser.add_argument("--retries", type=int, default=1,
                         help="new calls for lines with no clean rewrite yet")
+    if method and method.get("add_args"):
+        method["add_args"](parser)
     args = parser.parse_args()
+    if method and method.get("setup"):
+        method["setup"](args)
+    if args.samples is None:
+        args.samples = 4
+    prefix = method["prefix"] if method else "free"
+    label = method["version"] if method else VERSIONS[args.version]
+    version = 0 if method else args.version
 
     detector = ExplicitDetector()
     skip = reserved_ids()
-    records = [json.loads(l) for l in open(args.input, encoding="utf-8")]
-    records = [r for r in records if r["id"] not in skip and target_lines(r, detector)]
+    if args.missing:
+        found, open_targets = open_lines(detector, args.include_pending)
+        records = [r for sid, r in found.items() if sid not in skip]
+        if args.name is None and not args.dense:
+            args.name = f"{prefix}_missing_{label}"
+    else:
+        open_targets = None
+        records = [json.loads(l) for l in open(args.input, encoding="utf-8")]
+        records = [r for r in records if r["id"] not in skip and target_lines(r, detector)]
+        if not args.symbol_names:
+            records = [r for r in records if r["artist"].strip()[:1].isalpha()]
+        if args.order == "random":
+            if args.seed is None:
+                args.seed = int(time.time())  # a new seed every run, from the clock
+            print(f"shuffle seed: {args.seed}", flush=True)
+            random.Random(args.seed).shuffle(records)
+        # never again on sections a run already covers (any method): every run adds new data
+        done = generated_ids()
+        records = [r for r in records if r["id"] not in done]
+    if args.dense:
+        if open_targets is None:
+            open_targets = {r["id"]: target_lines(r, detector) for r in records}
+        by_id = {r["id"]: r["lines"] for r in records}
+        open_targets = {sid: [i for i in t if dense(by_id[sid][i], detector)]
+                        for sid, t in open_targets.items() if sid in by_id}
+        records = [r for r in records if open_targets.get(r["id"])]
+        if args.name is None:
+            args.name = f"{prefix}_{'missing_' if args.missing else ''}dense_{label}"
+    if args.limit is None:
+        args.limit = len(records) if args.missing else 10
     records = records[args.offset: args.offset + args.limit]
-    shots = examples({r["id"] for r in records}, creative=args.version >= 2)
-    by_rank = lambda c: rank(c, args.version)  # noqa: E731
+    shots = [] if method else examples({r["id"] for r in records}, creative=version >= 2)
+    by_rank = method["rank"] if method else (lambda c: rank(c, version))  # noqa: E731
     shot_text = "\n".join(f'- "{a}" -> "{b}"' for a, b in shots) or "- (none yet)"
     scorer = Scorer(detector)
     lyric_words()
     tok, model = load(args.model, False)
     started = time.time()
 
-    name = args.name or f"free_{Path(args.input).stem}_{VERSIONS[args.version]}"
+    # a run of its own: the default name has the time, so a run never overwrites another
+    name = args.name or f"{prefix}_{Path(args.input).stem}-{time.strftime('%Y%m%d-%H%M')}_{label}"
     out = paths.GENERATIONS_DIR / f"{name}.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         for n, record in enumerate(records, start=1):
-            targets = target_lines(record, detector)
-            lines = list(record["lines"])
+            targets = (open_targets[record["id"]] if open_targets is not None
+                       else target_lines(record, detector))
+            lines = list(record.get("shown") or record["lines"])
             cands: dict[int, list[dict]] = {i: [] for i in targets}
             raws: list[str] = []
-            for start in sorted({i // 4 * 4 for i in targets}):
+            for i in (sorted(targets) if method else []):
+                for attempt in range(args.retries + 1):
+                    found, raw = method["ask"](tok, model, scorer, record, lines, i,
+                                               args.samples, attempt)
+                    raws += raw
+                    cands[i] += found[i]
+                    best = min(cands[i], key=by_rank, default=None)
+                    if best and best["ok"]:
+                        lines[i] = best["line"]
+                        break
+            for start in ([] if method else sorted({i // 4 * 4 for i in targets})):
                 todo = [i for i in sorted(targets) if start <= i < start + 4]
                 for attempt in range(args.retries + 1):
                     found, raw = ask(tok, model, scorer, record, lines, start, todo,
-                                     shot_text, args.samples, attempt, args.version)
+                                     shot_text, args.samples, attempt, version)
                     raws += raw
                     for i, cs in found.items():
                         cands[i] += cs
@@ -453,6 +661,7 @@ def main() -> None:
                     todo = [i for i in todo if not any(c["ok"] for c in cands[i])]
                     if not todo:
                         break
+            lines = [l if i in targets else o for i, (l, o) in enumerate(zip(lines, record["lines"]))]
             units = []
             for i in sorted(targets):
                 order = sorted(range(len(cands[i])), key=lambda k: by_rank(cands[i][k]))
@@ -464,7 +673,8 @@ def main() -> None:
                 u["candidates"][u["chosen"]]["syllable_diff"] <= 1
                 and u["candidates"][u["chosen"]]["rhymes"] for u in done)
             f.write(json.dumps({
-                "id": record["id"], "model": args.model, "prompt_version": VERSIONS[args.version],
+                "id": record["id"], "model": args.model, "prompt_version": label,
+                "seed": args.seed,
                 "style": "free", "samples": args.samples, "temperature": 1.0,
                 "targets": sorted(targets), "raw": raws,
                 "rewrites": {str(i): l for i, (l, o) in enumerate(zip(lines, record["lines"]))

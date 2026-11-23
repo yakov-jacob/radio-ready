@@ -209,3 +209,49 @@ def end_rhyme_kept(original: str, rewrite: str) -> bool:
     """End word (fillers skipped) kept or a perfect rhyme."""
     a, b = end_word(original), end_word(rewrite)
     return bool(a and b) and (a == b or rhyme_key(a) == rhyme_key(b))
+
+
+QUOTES = "'\""
+
+
+def restore_quotes(original: str, rewrite: str) -> str:
+    """Put back the quote marks a model rewrite dropped (prompts unchanged; models often lose a
+    closing ' or " of the line):
+      - a double quote the original has at the start or end of the line and the rewrite lost
+        (only when the line's quotes stay balanced as in the original);
+      - an opening or closing single quote at the edge of the line, as in the original;
+      - a dropped-g apostrophe (fuckin' -> fightin): a rewritten word ending in -in that lines
+        up with an original word ending in -in' gets the apostrophe back.
+    A rewrite equal to the original, or empty, is returned as is."""
+    import difflib
+
+    if not rewrite or rewrite == original:
+        return rewrite
+    o, r = original.split(" "), rewrite.split(" ")
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(
+            None, [w.lower() for w in o], [w.lower() for w in r], autojunk=False).get_opcodes():
+        if op != "replace":
+            continue
+        for k, j in enumerate(range(j1, j2)):
+            src = o[i1 + min(k, i2 - i1 - 1)]
+            core = r[j].rstrip(".,!?;:\"")
+            tail = r[j][len(core):]
+            if (re.search(r"[A-Za-z]in'$", src.rstrip(".,!?;:\"")) and len(core) > 3
+                    and core.lower().endswith("in") and not core.endswith("'")):
+                r[j] = core + "'" + tail
+    out = " ".join(r)
+    if original.count('"') > out.count('"'):
+        fixed = out
+        if original.startswith('"') and not fixed.startswith('"'):
+            fixed = '"' + fixed
+        if (original.count('"') > fixed.count('"') and original.endswith('"')
+                and not fixed.endswith('"')):
+            fixed += '"'
+        if fixed.count('"') % 2 == original.count('"') % 2:  # never leave a quote unbalanced
+            out = fixed
+    if original.startswith("'") and not out.startswith("'"):
+        out = "'" + out
+    if (original.endswith("'") and not out.endswith("'")
+            and not re.search(r"[A-Za-z]in'$", original)):  # a closing quote, not a dropped g
+        out += "'"
+    return out
