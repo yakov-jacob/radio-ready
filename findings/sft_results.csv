@@ -1,0 +1,7 @@
+﻿metric,plain_sft,conditioned_sft
+best_lyric_validation_loss,0.2171,0.2168
+correct_line_count,0.900,0.975
+profanity_free_sections,0.943,0.943
+exact_syllable_preservation,0.744,0.750
+mean_absolute_syllable_deviation,0.326,0.409
+end_rhyme_preservation,0.837,0.841
