@@ -12,9 +12,19 @@ Training uses split == train (val for the validation loss); test-split examples 
 Genius sections reserved for commercial-LLM evaluation are never trained on. --sources picks
 the pair sources (paradehate for stage 1; genius kidzbop for stage 2).
 
-Control tokens (<edit>, <syl:N>, <rhyme:X>) are added to the tokenizer. Their embeddings are
-new trainable vectors (initialized to the mean input embedding), so the model can learn what
-they mean; LoRA alone cannot, because the base embedding matrix stays frozen.
+Control tokens (<edit>, <syl:N>, <rhyme:X>) are added to the tokenizer as single tokens in the
+prompt. Their embeddings are new trainable vectors, so the model can learn what they mean; LoRA
+alone cannot, because the base embedding matrix stays frozen. Each starts as the mean embedding
+of the words it stands for (MEANING: <syl:9> from "9 syllables", <edit> from "rewrite this
+line", numbers in words), so the tokens differ from the first step instead of all being one
+vector. ParaDeHate
+examples carry no control tokens (radio_ready.sft), so stage 1 is the same for the plain and the
+conditioned model and the tokens are learned in stage 2 only.
+
+Prompt format: with chat (the default for new runs) the prompt is the user turn of the base
+model's chat template, as the instruct model was trained; the completion then ends in its
+end-of-turn token. An adapter keeps the format it was trained with (config.json "chat"), and
+predict and the experiment scripts read it from there (format_prompt).
 
 LoRA (Hu et al., 2022): every attention and MLP projection W gets a trainable update
 (alpha / r) * B A, A in R^{r x d_in}, B in R^{d_out x r}, B = 0 at the start (so training
@@ -23,10 +33,12 @@ starts from the pretrained model); W stays frozen.
 Device: CUDA (bfloat16), then Apple MPS (float32), then CPU (float32).
 
 Commands:
-  train    python -m radio_ready.train train --data sft_edit_syl_rhyme --sources paradehate \
-               --name stage1
+  train    python -m radio_ready.train train --data sft_plain --sources paradehate --name stage1
+               (one full epoch of ParaDeHate; shared by both models)
+           python -m radio_ready.train train --data sft_plain --sources genius kidzbop \
+               --resume stage1 --name plain_stage2 --epochs 3
            python -m radio_ready.train train --data sft_edit_syl_rhyme --sources genius kidzbop \
-               --resume stage1 --name stage2 --epochs 3
+               --resume stage1 --name controlled_stage2 --epochs 3
   predict  python -m radio_ready.train predict --adapter stage2 [--input FILE] [--samples 8]
 
 Outputs:
@@ -82,11 +94,12 @@ class LoRALinear(nn.Module):
 class ControlEmbedding(nn.Module):
     """The frozen input embedding, except for the control tokens, which get trainable vectors."""
 
-    def __init__(self, base: nn.Embedding, new_ids: list[int]):
+    def __init__(self, base: nn.Embedding, new_ids: list[int], init: torch.Tensor | None = None):
         super().__init__()
         self.base = base
-        mean = base.weight.detach().float().mean(0)
-        self.ctrl_weight = nn.Parameter(mean.repeat(len(new_ids), 1).to(base.weight.device))
+        if init is None:
+            init = base.weight.detach().float().mean(0).repeat(len(new_ids), 1)
+        self.ctrl_weight = nn.Parameter(init.float().to(base.weight.device))
         lookup = torch.full((base.num_embeddings,), -1, dtype=torch.long)
         lookup[torch.tensor(new_ids)] = torch.arange(len(new_ids))
         self.register_buffer("lookup", lookup.to(base.weight.device), persistent=False)
@@ -103,6 +116,54 @@ class ControlEmbedding(nn.Module):
             out = out.clone()
             out[mask] = self.ctrl_weight[slot[mask]].to(out.dtype)
         return out
+
+
+ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+        "nineteen"]
+TENS = {2: "twenty", 3: "thirty", 4: "forty"}
+
+
+def number_words(n: int) -> str:
+    """1-49 in words (tokenizers split digits, so "12" and "21" would get the same mean)."""
+    if n < 20:
+        return ONES[n]
+    return TENS[n // 10] + ("" if n % 10 == 0 else "-" + ONES[n % 10])
+
+
+def meaning(token: str) -> list[str]:
+    """The words a control token stands for, as parts of equal weight in its start embedding."""
+    body = token.strip("<>")
+    name, _, value = body.partition(":")
+    if name == "syl" and value.isdigit():
+        return [number_words(int(value)), "syllables"]
+    if name == "rhyme":
+        return ["rhymes with", value]
+    if name == "edit":
+        return ["rewrite this line"]
+    return [body.replace(":", " ")]
+
+
+def meaning_init(tok, base: nn.Embedding, tokens: list[str]) -> torch.Tensor:
+    """Per control token, the mean over its meaning parts of each part's mean base embedding
+    (<syl:9>: half "nine", half "syllables"), so the tokens start apart and near their words."""
+    rows = []
+    for t in tokens:
+        parts = []
+        for words in meaning(t):
+            ids = tok(" " + words, add_special_tokens=False)["input_ids"]
+            parts.append(base.weight.detach()[torch.tensor(ids, device=base.weight.device)]
+                         .float().mean(0))
+        rows.append(torch.stack(parts).mean(0))
+    return torch.stack(rows)
+
+
+def format_prompt(tok, cfg: dict, prompt: str) -> str:
+    """The prompt as the adapter was trained on it: the chat template's user turn, or plain."""
+    if not cfg.get("chat"):
+        return prompt
+    return tok.apply_chat_template([{"role": "user", "content": prompt.rstrip("\n")}],
+                                   tokenize=False, add_generation_prompt=True)
 
 
 def add_lora(model: nn.Module, r: int, alpha: float, dropout: float) -> int:
@@ -143,7 +204,9 @@ def load_model(cfg: dict, adapter: Path | None, train: bool):
         p.requires_grad_(False)
     new_ids = tok.convert_tokens_to_ids(cfg["tokens"])
     if new_ids:
-        model.set_input_embeddings(ControlEmbedding(model.get_input_embeddings(), new_ids))
+        base = model.get_input_embeddings()
+        model.set_input_embeddings(ControlEmbedding(base, new_ids,
+                                                    meaning_init(tok, base, cfg["tokens"])))
     n = add_lora(model, cfg["r"], cfg["alpha"], cfg["dropout"] if train else 0.0)
     if adapter is not None:
         state = torch.load(adapter / "lora.pt", map_location="cpu")
@@ -183,9 +246,9 @@ def load_examples(name: str, sources: list[str] | None, limit: int | None):
     return split["train"], split["val"], tokens, controls
 
 
-def encode(tok, ex: dict, max_len: int) -> dict | None:
+def encode(tok, ex: dict, max_len: int, cfg: dict | None = None) -> dict | None:
     """Token ids with labels = IGNORE on the prompt (loss on the completion only)."""
-    src = tok(ex["prompt"], add_special_tokens=False)["input_ids"]
+    src = tok(format_prompt(tok, cfg or {}, ex["prompt"]), add_special_tokens=False)["input_ids"]
     tgt = tok(ex["completion"], add_special_tokens=False)["input_ids"] + [tok.eos_token_id]
     if len(src) + len(tgt) > max_len:
         return None
@@ -233,9 +296,11 @@ def train(args) -> None:
     train_ex, val_ex, tokens, controls = load_examples(args.data, args.sources, args.limit)
     resume = MODELS_DIR / args.resume if args.resume else None
     cfg = {"base": args.base, "r": args.r, "alpha": args.alpha, "dropout": args.dropout}
+    cfg["chat"] = args.chat
     if resume:
         prev = json.loads((resume / "config.json").read_text())
         cfg.update({k: prev[k] for k in ("base", "r", "alpha")})
+        cfg["chat"] = prev.get("chat", False)  # one prompt format across stages
         tokens = sorted(set(tokens) | set(prev["tokens"]))
     cfg.update({"tokens": sorted(tokens), "controls": controls, "data": args.data,
                 "sources": args.sources, "resume": args.resume})
@@ -247,15 +312,15 @@ def train(args) -> None:
         model.load_state_dict({k: v for k, v in old.items() if k not in ctrl}, strict=False)
         emb = model.get_input_embeddings()
         with torch.no_grad():
-            for i, t in enumerate(prev["tokens"]):
+            for i, t in enumerate(prev["tokens"]):  # none when stage 1 had no control tokens
                 emb.ctrl_weight[cfg["tokens"].index(t)] = old[ctrl[0]][i]
     else:
         tok, model, device = load_model(cfg, resume, train=True)
     (out / "lora.pt").unlink(missing_ok=True)
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
 
-    enc = [e for e in (encode(tok, x, args.max_len) for x in train_ex) if e]
-    val = [e for e in (encode(tok, x, args.max_len) for x in val_ex) if e][: args.max_val]
+    enc = [e for e in (encode(tok, x, args.max_len, cfg) for x in train_ex) if e]
+    val = [e for e in (encode(tok, x, args.max_len, cfg) for x in val_ex) if e][: args.max_val]
     print(f"encoded: train {len(enc)} ({len(train_ex) - len(enc)} longer than {args.max_len} "
           f"tokens left out), val {len(val)}", flush=True)
     params = [p for p in model.parameters() if p.requires_grad]
@@ -352,6 +417,7 @@ def predict(args) -> None:
             prompts = [example({"id": r["id"], "source": "genius", "split": "test",
                                 "original": r["lines"], "rewrite": r["lines"]},
                                cfg["controls"], detector)["prompt"] for r in batch]
+            prompts = [format_prompt(tok, cfg, p) for p in prompts]
             enc = tok(prompts, return_tensors="pt", padding=True, add_special_tokens=False)
             enc = enc.to(device)
             sampling = ({"do_sample": True, "temperature": args.temperature, "top_p": args.top_p,
@@ -405,6 +471,9 @@ def main() -> None:
     t.add_argument("--eval-every", type=int, default=100)
     t.add_argument("--limit", type=int, default=None, help="training examples (smoke test)")
     t.add_argument("--seed", type=int, default=42)
+    t.add_argument("--chat", action=argparse.BooleanOptionalAction, default=True,
+                   help="prompt as the chat template's user turn (default; a resumed run keeps "
+                        "the format of the adapter it resumes)")
     p = sub.add_parser("predict")
     p.add_argument("--adapter", required=True, help="folder under outputs/sft_models")
     p.add_argument("--input", default=str(EVAL_SECTIONS_JSONL))

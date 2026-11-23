@@ -4,7 +4,7 @@ import random
 from pathlib import Path
 
 import torch
-from radio_ready.train import load_model
+from radio_ready.train import format_prompt, load_model
 
 data_dir = Path("data/processed/sft")
 model_dir = Path("outputs/sft_models")
@@ -57,7 +57,7 @@ for model_name, dataset in [
     tok, model, device = load_model(cfg, adapter, train=False)
 
     for i, sid in enumerate(selected, 1):
-        prompt = dataset[sid]["prompt"]
+        prompt = format_prompt(tok, cfg, dataset[sid]["prompt"])  # as trained
         encoded = tok(
             prompt,
             return_tensors="pt",

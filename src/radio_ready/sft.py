@@ -20,7 +20,12 @@ Controls (--controls, any of):
   rhyme   <rhyme:X>  the line's letter in the original section's rhyme scheme
   end     <end:KEY>  the line's end-rhyme sound (CMU stressed vowel key, open vocabulary)
   stress  <stress:0101>  CMU stress pattern of the line (open vocabulary)
-Single-line pairs (ParaDeHate) get only edit and syl. Token spelling: TOKEN_FORMAT.
+ParaDeHate pairs (stage 1) get no control tokens: their rewrites change length freely (12%
+of rewritten lines stay within one syllable of the original) and 46% of rewritten lines have no
+detected explicit word, so <syl:N> and <edit> there would teach the model to ignore the tokens.
+Stage 1 teaches detoxification only; the tokens are learned on the lyric pairs (stage 2), where
+they hold (92% within one syllable; <edit> marks the rewritten lines). Token spelling:
+TOKEN_FORMAT.
 
 Run:  python -m radio_ready.sft                                   # no control tokens
       python -m radio_ready.sft --controls edit syl rhyme
@@ -81,6 +86,8 @@ def control_tokens(lines: list[str], controls: list[str], detector) -> list[list
 
 def example(pair: dict, controls: list[str], detector) -> dict:
     kind = "paradehate" if pair["source"] == "paradehate" else "lyrics"
+    if kind == "paradehate":
+        controls = []  # see the module docstring
     tokens = control_tokens(pair["original"], controls, detector)
     rows = [" ".join(t + [line]) for t, line in zip(tokens, pair["original"])]
     return {
