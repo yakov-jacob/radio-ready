@@ -19,7 +19,7 @@ from radio_ready import paths
 from radio_ready.explicit import ExplicitDetector
 from radio_ready.rewrite import rhyme_partners, rhymes
 from radio_ready.sft import example
-from radio_ready.text import syllables
+from radio_ready.text import rhyme_scheme, syllables
 from radio_ready.train import MODELS_DIR, format_prompt, load_model, parse_completion
 
 OUT = paths.OUTPUTS / "evaluation" / "adapters"
@@ -62,7 +62,7 @@ def score(sections: list[dict], preds: list[dict], detector) -> dict:
             continue
         c["valid"] += 1
         c["clean"] += not detector.find("\n".join(lines))
-        rec = {"lines": p["original"]}
+        rec = {"lines": p["original"], "rhyme_scheme": rhyme_scheme(p["original"])}
         for i, (o, w) in enumerate(zip(p["original"], lines)):
             if not detector.find(o):
                 c["unflagged"] += 1
@@ -78,16 +78,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Score adapters on test-split lyric sections.")
     parser.add_argument("adapters", nargs="+")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--again", action="store_true", help="generate even if saved")
     args = parser.parse_args()
     detector = ExplicitDetector()
     sections = test_sections()[: args.limit]
     OUT.mkdir(parents=True, exist_ok=True)
     rows = []
     for a in args.adapters:
-        preds = run(a, sections, detector)
-        with open(OUT / f"{a}.jsonl", "w", encoding="utf-8") as f:
-            for x in preds:
-                f.write(json.dumps(x, ensure_ascii=False) + "\n")
+        saved = OUT / f"{a}.jsonl"
+        if saved.exists() and not args.again:  # predictions of an earlier run of this script
+            preds = [json.loads(l) for l in open(saved, encoding="utf-8")][: len(sections)]
+        else:
+            preds = run(a, sections, detector)
+            with open(saved, "w", encoding="utf-8") as f:
+                for x in preds:
+                    f.write(json.dumps(x, ensure_ascii=False) + "\n")
         rows.append((a, score(sections, preds, detector)))
     print("| Adapter | Line count right | Clean | Exact syllables (changed) | Rhyme kept (changed) "
           "| Unflagged lines copied |")
